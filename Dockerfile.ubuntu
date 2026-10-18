@@ -1,0 +1,142 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# binutils checks the binary. cargo only reads the dependency graph of the
+# release tag and downloads the crates for their license files; it compiles
+# nothing. curl and xz fetch the source of the Rust standard library, also
+# for its license files.
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      binutils \
+      ca-certificates \
+      cargo \
+      curl \
+      git \
+      xz-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+# typos publishes one static musl binary per architecture, which runs on any
+# Linux distribution. ADD checks each tarball against the SHA-256 pinned in
+# package.yml and leaves a remote tarball packed; the next step unpacks the
+# one for TARGETARCH.
+ARG VERSION
+ARG MUSL_AMD64_SHA256
+ARG MUSL_ARM64_SHA256
+ADD --checksum=sha256:${MUSL_AMD64_SHA256} https://github.com/crate-ci/typos/releases/download/v${VERSION}/typos-v${VERSION}-x86_64-unknown-linux-musl.tar.gz /tmp/dl/
+ADD --checksum=sha256:${MUSL_ARM64_SHA256} https://github.com/crate-ci/typos/releases/download/v${VERSION}/typos-v${VERSION}-aarch64-unknown-linux-musl.tar.gz /tmp/dl/
+
+# The binary is installed as published. It must be built for TARGETARCH, load
+# no libraries and report this version.
+ARG SOURCE_COMMIT
+ARG TARGETARCH
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    case "${TARGETARCH}" in \
+      amd64) arch=x86_64; machine='Advanced Micro Devices X86-64'; sha256="${MUSL_AMD64_SHA256}" ;; \
+      arm64) arch=aarch64; machine=AArch64; sha256="${MUSL_ARM64_SHA256}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    asset="typos-v${VERSION}-${arch}-unknown-linux-musl.tar.gz"; \
+    mkdir /tmp/unpacked; \
+    tar -xzf "/tmp/dl/${asset}" -C /tmp/unpacked ./typos; \
+    install -D -m 755 /tmp/unpacked/typos /out/usr/local/bin/typos; \
+    typos=/out/usr/local/bin/typos; \
+    readelf -hW "$typos" > /tmp/elf-header; \
+    got="$(sed -n 's/^ *Machine: *//p' /tmp/elf-header)"; \
+    test "$got" = "$machine" || { echo "expected a binary for ${machine}, got: ${got}" >&2; exit 1; }; \
+    readelf -lW "$typos" > /tmp/elf-segments; \
+    if grep -E '^ +INTERP ' /tmp/elf-segments; then echo "typos is not statically linked" >&2; exit 1; fi; \
+    readelf -dW "$typos" > /tmp/elf-dynamic; \
+    if grep -F '(NEEDED)' /tmp/elf-dynamic; then echo "typos is not statically linked" >&2; exit 1; fi; \
+    "$typos" --version > /tmp/typos-version; \
+    test "$(cat /tmp/typos-version)" = "typos-cli ${VERSION}" \
+      || { echo "expected typos-cli ${VERSION}, got: $(cat /tmp/typos-version)" >&2; exit 1; }; \
+    readelf -p .comment "$typos" > /tmp/elf-comment; \
+    rustc="$(awk 'match($0, /rustc version [^)]*\)/) { print substr($0, RSTART, RLENGTH); exit }' /tmp/elf-comment)"; \
+    echo "${arch}-unknown-linux-musl" > /tmp/target; \
+    echo "https://github.com/crate-ci/typos/releases/download/v${VERSION}/${asset}" > /tmp/binary-url; \
+    { \
+      echo "binary: ${asset}"; \
+      echo "binary-sha256: ${sha256}"; \
+      echo "typos-sha256: $(sha256sum "$typos" | cut -d ' ' -f 1)"; \
+      echo "version: $(cat /tmp/typos-version)"; \
+      echo "rustc: ${rustc:-unknown}"; \
+    } > /tmp/buildinfo
+
+ARG BASE_IMAGE
+# The release tag is cloned and must point to the commit pinned in
+# package.yml. typos's own license files come from it, and the VarCon
+# copyright notice is cut from the README of the word list that typos-vars
+# is generated from. crate-licenses.sh copies the license files of the crates
+# in Cargo.lock that typos-cli depends on, and checks that every crate whose
+# source path the binary contains is among them. rust-licenses.sh copies those
+# of the Rust standard library and of LLVM's libunwind, which are linked into
+# the binary, from the source of the Rust release that built it. licenses/
+# holds the other texts: those that crates do not ship, the license and
+# notices of misspell, codespell and Wikipedia, whose word lists typos's own
+# draws on, a notice that marks the VarCon data in the binary as modified,
+# and musl's, which is linked in too. The binary loads no libraries, so
+# runtime-deps only has the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=scripts/crate-licenses.sh,target=/tmp/crate-licenses.sh \
+    --mount=type=bind,source=scripts/rust-licenses.sh,target=/tmp/rust-licenses.sh \
+    --mount=type=bind,source=licenses,target=/tmp/licenses \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/crate-ci/typos.git /src/typos; \
+    test "$(git -C /src/typos rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    grep -Fqx "version = \"${VERSION}\"" /src/typos/crates/typos-cli/Cargo.toml \
+      || { echo "crates/typos-cli/Cargo.toml is not version ${VERSION}" >&2; exit 1; }; \
+    meta=/out/usr/local/share/randomcontainers/typos; \
+    mkdir -p "$meta/licenses/varcon"; \
+    cp /src/typos/LICENSE-MIT /src/typos/LICENSE-APACHE "$meta/licenses/"; \
+    awk '$0 == "Copyright" { c = 1 } c' /src/typos/crates/varcon/assets/README > "$meta/licenses/varcon/COPYRIGHT"; \
+    for s in 'Kevin Atkinson' 'Benjamin Titze' 'Geoff Kuenning' 'Permission to use, copy, modify'; do \
+      grep -Fq "$s" "$meta/licenses/varcon/COPYRIGHT" \
+        || { echo "the VarCon notice does not mention: $s" >&2; exit 1; }; \
+    done; \
+    cp /tmp/licenses/varcon/NOTICE "$meta/licenses/varcon/"; \
+    cp -R /tmp/licenses/misspell /tmp/licenses/codespell /tmp/licenses/wikipedia /tmp/licenses/musl \
+      "$meta/licenses/"; \
+    sh /tmp/crate-licenses.sh /src/typos typos-cli "$(cat /tmp/target)" /out/usr/local/bin/typos \
+      "$meta/licenses/crates" /tmp/licenses/crates > /tmp/crates; \
+    sh /tmp/rust-licenses.sh /out/usr/local/bin/typos "$meta/licenses/rust" > /tmp/rust-src; \
+    find "$meta/licenses" -type d -exec chmod 0755 {} \;; \
+    find "$meta/licenses" -type f -exec chmod 0644 {} \;; \
+    if find "$meta/licenses" -type f -size 0 | grep .; then echo "empty license file" >&2; exit 1; fi; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/crate-ci/typos.git@${SOURCE_COMMIT}" \
+      "$(cat /tmp/binary-url)" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      cat /tmp/buildinfo; \
+      echo "cargo: $(cargo --version)"; \
+      cat /tmp/rust-src; \
+      echo "crates:"; \
+      sed 's/^/  /' /tmp/crates; \
+    } > "$meta/buildinfo"; \
+    LC_ALL=C sort -u /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/typos/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "typos"]
