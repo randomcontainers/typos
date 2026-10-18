@@ -1,0 +1,19 @@
+typos's list of misspellings, which is compiled into the typos binary,
+includes entries taken in 2026 from the list of common misspellings that
+Wikipedia contributors maintain at
+https://en.wikipedia.org/wiki/Wikipedia:Lists_of_common_misspellings/For_machines
+(commit 74e06603 "feat(dict): Extend from wikipedia's list" in
+crate-ci/typos, 2026-01-07). typos took a selection of the entries and
+merged them into its own list, in its own format. The authors of the list
+are the contributors named in the history of that page. The typos
+repository keeps a copy of the list in
+crates/wikipedia-dict/assets/dictionary.txt.
+
+Wikipedia releases the text of its pages under the Creative Commons
+Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0),
+https://creativecommons.org/licenses/by-sa/4.0/. Text added before June
+2023 was contributed under CC BY-SA 3.0, whose text is in
+../codespell/CC-BY-SA-3.0.
+
+Other entries reached typos from Wikipedia's list through misspell and
+codespell; see ../misspell/LICENSE and ../codespell/NOTICE.

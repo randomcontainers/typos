@@ -1,0 +1,5 @@
+typos generates its tables of American, British, Canadian and Australian
+spellings from VarCon's list (crates/varcon/assets/varcon.txt in
+crate-ci/typos), so the copy compiled into the typos binary is a modified
+version of VarCon. VarCon's copyright and permission notices are in the file
+COPYRIGHT next to this one.
