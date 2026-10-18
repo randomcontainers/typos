@@ -1,5 +1,6 @@
 *
 !licenses
+!runtime-deps.alpine
 !runtime-deps.ubuntu
 !scripts/crate-licenses.sh
 !scripts/rust-licenses.sh
