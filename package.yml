@@ -1,0 +1,127 @@
+name: typos
+title: typos
+summary: Finds and fixes misspelled words in source code, comments and documentation, using a list of known typos that keeps false positives low.
+homepage: https://github.com/crate-ci/typos
+# typos is MIT OR Apache-2.0, and so are most of the crates compiled into it;
+# the label takes MIT wherever a crate offers it. supports-unicode is
+# Apache-2.0 only, encoding_rs includes WHATWG data under BSD-3-Clause and
+# unicode-ident includes Unicode data under Unicode-3.0. The Rust standard
+# library and the crates it uses (MIT or a choice that includes it, with
+# compiler-builtins also under Apache-2.0 WITH LLVM-exception), musl (MIT)
+# and LLVM's libunwind (Apache-2.0 WITH LLVM-exception) are linked in. The
+# British, Canadian and Australian spellings come from VarCon, whose
+# permission notices have no SPDX identifier. Inflector (BSD-2-Clause) is
+# used only by serde-sarif's build script and is not part of the binary.
+# The list of misspellings started from misspell's (MIT), which began with a
+# list from Wikipedia. In 2023 and 2026 it took entries from codespell's
+# dictionary, which codespell releases under CC-BY-SA-3.0 as a derivative of
+# English Wikipedia. On 2026-01-07 it also took entries directly from
+# Wikipedia's Lists_of_common_misspellings/For_machines (74e06603), whose
+# text added since June 2023 is CC-BY-SA-4.0, and again from misspell, by
+# then the golangci/misspell fork under the same MIT text. Upstream ships the
+# whole list under its own terms (crate-ci/typos#44 is still open); the label
+# adds CC-BY-SA-3.0, as the codespell image's label does.
+license: MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND Apache-2.0 WITH LLVM-exception AND LicenseRef-VarCon AND CC-BY-SA-3.0
+upstream:
+  source: github-release
+  repository: crate-ci/typos
+  # The release workflow uploads every binary to a draft and then publishes
+  # it, so a release is complete when it is read.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.51.1
+  # The images ship upstream's release binaries. The tag is cloned for the
+  # license files and for Cargo.lock, which lists the crates in the binary.
+  git:
+    url: https://github.com/crate-ci/typos.git
+    tag: v{version}
+    commit: 7f9d0819ca1c008ade73f4b41fa9d258d48f605b
+  # Static musl binaries, one per architecture, used on Ubuntu and Alpine
+  # alike. Each is pinned to the SHA-256 that GitHub records for the release
+  # asset.
+  extra-artifacts:
+    musl-amd64:
+      url: https://github.com/crate-ci/typos/releases/download/v{version}/typos-v{version}-x86_64-unknown-linux-musl.tar.gz
+      sha256: 93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454
+    musl-arm64:
+      url: https://github.com/crate-ci/typos/releases/download/v{version}/typos-v{version}-aarch64-unknown-linux-musl.tar.gz
+      sha256: 2ac5e37b3236b3c07dec5cdf1527acf143aec4674a6089b0bf424d021b35e099
+image:
+  # No CMD: without arguments typos checks the current directory, /work.
+  entrypoint: [typos]
+test:
+  - |
+    typos --version > version.txt
+    test "$(cat version.txt)" = "typos-cli $VERSION" \
+      || { echo "expected 'typos-cli $VERSION', got '$(cat version.txt)'" >&2; exit 1; }
+  - |
+    # Exit status 2 means that typos were found. Words inside identifiers
+    # are checked too.
+    mkdir detect
+    printf 'Fix teh bug.\n' > detect/notes.md
+    printf 'let recieveData = 1;\n' > detect/main.rs
+    status=0
+    typos --format json detect/notes.md detect/main.rs > detect.json || status=$?
+    test "$status" = 2 || { echo "expected exit status 2, got $status" >&2; cat detect.json >&2; exit 1; }
+    # has PATH TEXT: a line of detect.json for PATH contains TEXT.
+    has() {
+      grep -F "\"path\":\"$1\"," detect.json | grep -Fq "$2" \
+        || { echo "expected $2 for $1, got:" >&2; cat detect.json >&2; exit 1; }
+    }
+    has detect/notes.md '"line_num":1,'
+    has detect/notes.md '"typo":"teh","corrections":["the"]'
+    has detect/main.rs '"typo":"recieve","corrections":["receive"]'
+    printf 'Fix the bug.\n' > detect/clean.md
+    typos detect/clean.md
+  - |
+    # --write-changes fixes files in place, and stdin to stdout.
+    mkdir fix
+    printf 'Fix teh bug.\nThe adress is wrong.\n' > fix/notes.md
+    typos --write-changes fix/notes.md
+    printf 'Fix the bug.\nThe address is wrong.\n' > fix/want.md
+    cmp fix/want.md fix/notes.md || { echo "fix/notes.md was not fixed:" >&2; cat fix/notes.md >&2; exit 1; }
+    typos fix/notes.md
+    printf 'Apropriate world\n' | typos --write-changes - > fix/stdin.txt
+    printf 'Appropriate world\n' > fix/want.txt
+    cmp fix/want.txt fix/stdin.txt || { echo "expected 'Appropriate world', got:" >&2; cat fix/stdin.txt >&2; exit 1; }
+  - |
+    # The British, Canadian and Australian spellings are compiled in.
+    mkdir locale
+    printf 'The color is nice.\n' > locale/note.md
+    status=0
+    typos --format json --locale en-gb locale/note.md > locale.json || status=$?
+    test "$status" = 2 || { echo "expected exit status 2 for en-gb, got $status" >&2; cat locale.json >&2; exit 1; }
+    grep -Fq '"typo":"color","corrections":["colour"]' locale.json \
+      || { echo "expected color -> colour, got:" >&2; cat locale.json >&2; exit 1; }
+    typos --locale en-us locale/note.md
+    # The same setting in a config file next to the file.
+    printf '[default]\nlocale = "en-gb"\n' > locale/_typos.toml
+    status=0
+    typos locale/note.md > /dev/null || status=$?
+    test "$status" = 2 || { echo "expected exit status 2 with locale/_typos.toml, got $status" >&2; exit 1; }
+  - |
+    # Without arguments typos walks the current directory and reads its
+    # config file.
+    mkdir -p walk/docs walk/vendor
+    printf 'Fix teh bug.\n' > walk/docs/guide.md
+    printf 'Fix teh bug.\n' > walk/vendor/lib.md
+    printf '[files]\nextend-exclude = ["vendor/"]\n' > walk/_typos.toml
+    cd walk || exit 1
+    status=0
+    typos --format json > ../walk.json || status=$?
+    test "$status" = 2 || { echo "expected exit status 2, got $status" >&2; cat ../walk.json >&2; exit 1; }
+    grep -Fq '"path":"./docs/guide.md",' ../walk.json \
+      || { echo "expected a typo in ./docs/guide.md, got:" >&2; cat ../walk.json >&2; exit 1; }
+    if grep -F vendor ../walk.json >&2; then echo "vendor/ is not excluded" >&2; exit 1; fi
+    printf '[default.extend-words]\nteh = "teh"\n' >> _typos.toml
+    typos
+examples:
+  - title: Check the files in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/typos
+  - title: Fix the typos in place
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/typos --write-changes
+  - title: Write the results as SARIF for code scanning
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/typos --format sarif > typos.sarif
+  - title: Correct text on stdin
+    command: echo 'Fix teh bug.' | docker run --rm -i ghcr.io/randomcontainers/typos --write-changes -
