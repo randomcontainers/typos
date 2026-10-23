@@ -1,4 +1,4 @@
-# version: 1
+# version: 3
 """Collect the license files of a Rust program and check its license label.
 
 Usage:
@@ -22,14 +22,18 @@ across versions, <extra>/<name>/. Its files are added to the crate's. A file
 EXPRESSION in it gives the license of a crate that has only a license-file,
 and must equal the crate's license expression when the crate has one. A
 directory without a version must have an EXPRESSION file, so that it is
-looked at again when the license changes. A crate uses its versioned
-directory if there is one, and the directory without a version otherwise. A
-crate with a `links` key builds or links native code, which its own license
-files may not cover. When it is linked into a binary, it needs a directory
-here, or a line in <extra>/native-covered, either `<name>` or
-`<name>@<version>`, optionally followed by `: <path>` to copy a license file
-from inside the crate. Every directory and line must be used by a crate the
-binaries record, and a crate without any license file stops the build.
+looked at again when the license changes. When a crate's expression leaves
+something out, such as data it compiles in under other terms, a file
+DECLARED next to EXPRESSION holds the crate's own expression, which it must
+equal, and EXPRESSION the one to use instead. Neither file is copied. A
+crate uses its versioned directory if there is one, and the directory
+without a version otherwise. A crate with a `links` key builds or links
+native code, which its own license files may not cover. When it is linked
+into a binary, it needs a directory here, or a line in
+<extra>/native-covered, either `<name>` or `<name>@<version>`, optionally
+followed by `: <path>` to copy a license file from inside the crate. Every
+directory and line must be used by a crate the binaries record, and a crate
+without any license file stops the build.
 
 The license guard: package.yml's `license:` line gives the allowed terms (an
 identifier, or one with WITH and its exception). A crate linked into a binary
@@ -37,7 +41,13 @@ passes when one choice of its expression uses only those terms; build-time
 crates (proc macros and build scripts) are not linked and are not checked. A
 crate that is available only under MPL, EPL or CDDL has its .crate file
 copied to <sources>/, checked against Cargo.lock. A crate that needs a GPL,
-LGPL or AGPL term stops the build.
+LGPL or AGPL term passes only when the label has that term.
+
+A label with a GPL, LGPL or AGPL term puts the binaries as a whole under
+that license, and their corresponding source includes every crate compiled
+into them. The .crate file of every crates.io crate that the binaries record,
+build-time crates included, is then copied to <sources>/, checked against
+Cargo.lock.
 
 The Rust standard library is linked in too. Its license files are copied from
 <rust-src> (the unpacked rust-src component) to <licenses>/rust/, without
@@ -252,7 +262,7 @@ def copy_license_files(directory: Path, root: Path, dest: Path, license_file: st
 
 def copy_tree(source: Path, dest: Path) -> None:
     for f in sorted(source.rglob("*")):
-        if f.is_file() and f.relative_to(source).as_posix() != "EXPRESSION":
+        if f.is_file() and f.relative_to(source).as_posix() not in ("EXPRESSION", "DECLARED"):
             target = dest / f.relative_to(source)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(f, target)
@@ -322,6 +332,7 @@ def main() -> None:
 
     allowed = label_terms(args.package_yml)
     order = {k: i for i, k in enumerate(allowed)}
+    all_sources = any(copyleft(frozenset([term]), STRONG_COPYLEFT) for term in allowed.values())
 
     # Crates recorded in the binaries: one entry per name, version and source;
     # a crate is runtime if any binary links it.
@@ -398,7 +409,15 @@ def main() -> None:
 
         expression = p.get("license")
         given = (extra / "EXPRESSION").read_text(encoding="utf-8").strip() if extra and (extra / "EXPRESSION").is_file() else None
-        if given is not None and expression is not None and " ".join(given.split()) != " ".join(expression.split()):
+        declared = (extra / "DECLARED").read_text(encoding="utf-8").strip() if extra and (extra / "DECLARED").is_file() else None
+        if declared is not None:
+            if given is None:
+                fail(f"{extra}/DECLARED needs an EXPRESSION file next to it")
+            elif expression is None or " ".join(declared.split()) != " ".join(expression.split()):
+                fail(f"{name} {version} is now '{expression}', but {extra}/DECLARED says '{declared}'; check the files there and update it")
+            else:
+                expression = given
+        elif given is not None and expression is not None and " ".join(given.split()) != " ".join(expression.split()):
             fail(f"{name} {version} is now '{expression}', but {extra}/EXPRESSION says '{given}'; check the files there and update it")
         expression = expression or given
 
@@ -427,6 +446,7 @@ def main() -> None:
             fail(f"{name} {version} has no license file; add it to {args.extra}/{name}-{version}/")
 
         terms = "-"
+        weak = False
         if expression is None:
             if source == "crates.io" or kind == "runtime":
                 fail(f"{name} {version} has no license expression; add {args.extra}/{name}-{version}/EXPRESSION")
@@ -444,10 +464,9 @@ def main() -> None:
             elif covered:
                 best = covered[0]
                 terms = " AND ".join(sorted(best, key=lambda t: order[key(t)]))
-                if copyleft(best, STRONG_COPYLEFT):
-                    fail(f"{name} {version}: '{expression}' needs {terms}, which is not supported until source releases carry crate sources")
-                elif copyleft(best, WEAK_COPYLEFT) and source == "crates.io":
-                    sources.append((name, version, directory))
+                weak = copyleft(best, WEAK_COPYLEFT)
+        if source == "crates.io" and (all_sources or weak):
+            sources.append((name, version, directory))
         rows.append((name, version, source, kind, expression, terms))
 
     for name in sorted(set(extra_dirs) - used_dirs):
