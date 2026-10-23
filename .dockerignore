@@ -1,6 +1,9 @@
 *
+!cargo-config.sha256
+!keys/rust.gpg
 !licenses
+!package.yml
 !runtime-deps.alpine
 !runtime-deps.ubuntu
-!scripts/crate-licenses.sh
-!scripts/rust-licenses.sh
+!scripts/cargo-licenses.py
+!scripts/rust-toolchain.sh

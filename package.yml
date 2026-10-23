@@ -5,10 +5,11 @@ homepage: https://github.com/crate-ci/typos
 # typos is MIT OR Apache-2.0, and so are most of the crates compiled into it;
 # the label takes MIT wherever a crate offers it. supports-unicode is
 # Apache-2.0 only, encoding_rs includes WHATWG data under BSD-3-Clause and
-# unicode-ident includes Unicode data under Unicode-3.0. The Rust standard
-# library and the crates it uses (MIT or a choice that includes it, with
-# compiler-builtins also under Apache-2.0 WITH LLVM-exception), musl (MIT)
-# and LLVM's libunwind (Apache-2.0 WITH LLVM-exception) are linked in. The
+# unicode-ident includes Unicode data under Unicode-3.0. The build stops when
+# a crate linked into typos has a license that this label does not cover
+# (scripts/cargo-licenses.py reads the line). The Rust standard library and
+# the crates it uses are linked in too: MIT or a choice that includes it,
+# with compiler-builtins also under Apache-2.0 WITH LLVM-exception. The
 # British, Canadian and Australian spellings come from VarCon, whose
 # permission notices have no SPDX identifier. Inflector (BSD-2-Clause) is
 # used only by serde-sarif's build script and is not part of the binary.
@@ -25,28 +26,43 @@ license: MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND Apache-2.0 WITH
 upstream:
   source: github-release
   repository: crate-ci/typos
-  # The release workflow uploads every binary to a draft and then publishes
-  # it, so a release is complete when it is read.
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
   version: 1.51.1
-  # The images ship upstream's release binaries. The tag is cloned for the
-  # license files and for Cargo.lock, which lists the crates in the binary.
+  # The release tag is built with its Cargo.lock, and cargo checks every crate
+  # it downloads against the checksum there.
   git:
     url: https://github.com/crate-ci/typos.git
     tag: v{version}
     commit: 7f9d0819ca1c008ade73f4b41fa9d258d48f605b
-  # Static musl binaries, one per architecture, used on Ubuntu and Alpine
-  # alike. Each is pinned to the SHA-256 that GitHub records for the release
-  # asset.
   extra-artifacts:
-    musl-amd64:
-      url: https://github.com/crate-ci/typos/releases/download/v{version}/typos-v{version}-x86_64-unknown-linux-musl.tar.gz
-      sha256: 93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454
-    musl-arm64:
-      url: https://github.com/crate-ci/typos/releases/download/v{version}/typos-v{version}-aarch64-unknown-linux-musl.tar.gz
-      sha256: 2ac5e37b3236b3c07dec5cdf1527acf143aec4674a6089b0bf424d021b35e099
+    # The Rust release manifest, signed with the Rust release key in
+    # keys/rust.gpg. scripts/rust-toolchain.sh installs rustc, cargo,
+    # rust-std and rust-src from the archives it lists, each checked against
+    # the SHA-256 the manifest gives. The reconciler moves version and sha256
+    # to each new stable release once it is 7 days old.
+    rust-toolchain:
+      version: 1.99.1
+      url: https://static.rust-lang.org/dist/channel-rust-{version}.toml
+      checksums: {url: 'https://static.rust-lang.org/dist/channel-rust-{version}.toml.sha256', algorithm: sha256}
+      signature: https://static.rust-lang.org/dist/channel-rust-{version}.toml.asc
+      sha256: fb152be80975c194aa5fc684b2aec3a6e14e2b855efe2faa4e5f8ae6e590f463
+      track:
+        source: html-index
+        url: https://static.rust-lang.org/dist/channel-rust-stable.toml
+        pattern: '^url = "https://static\.rust-lang\.org/dist/(?P<date>\d{4}-\d{2}-\d{2})/rustc-(?P<version>\d+\.\d+\.\d+)-x86_64-unknown-linux-gnu\.tar\.gz"$'
+        versioning: semver
+        cooldown: 7d
+        skip: []
+    # Built from its crate and used only in the build stage. It stores the
+    # list of crates in the typos binary, where SBOM tools and image scanners
+    # read it. Update version and sha256 together, with the checksum from the
+    # crates.io index.
+    cargo-auditable:
+      version: 0.7.7
+      url: https://static.crates.io/crates/cargo-auditable/cargo-auditable-{version}.crate
+      sha256: ccdd489bc94d1338cd04389a842e00661300331ec915fb376b4810ef7d480b5d
 image:
   # No CMD: without arguments typos checks the current directory, /work.
   entrypoint: [typos]
@@ -55,6 +71,14 @@ test:
     typos --version > version.txt
     test "$(cat version.txt)" = "typos-cli $VERSION" \
       || { echo "expected 'typos-cli $VERSION', got '$(cat version.txt)'" >&2; exit 1; }
+  - |
+    # typos is linked against the C library of the image it was built in, and
+    # its .dep-v0 section lists the crates it was built from.
+    head -c 4096 /usr/local/bin/typos | LC_ALL=C tr -c 'A-Za-z0-9_./-' '\n' | grep -E '^/lib(64)?/ld-' > loader.txt \
+      || { echo "typos names no dynamic loader" >&2; exit 1; }
+    loader=$(head -n 1 loader.txt)
+    test -e "$loader" || { echo "typos needs $loader, which is not in the image" >&2; exit 1; }
+    LC_ALL=C grep -Fq .dep-v0 /usr/local/bin/typos || { echo "typos has no .dep-v0 section" >&2; exit 1; }
   - |
     # Exit status 2 means that typos were found. Words inside identifiers
     # are checked too.

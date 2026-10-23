@@ -3,129 +3,188 @@
 
 ARG BASE_IMAGE=ubuntu:26.04
 
-FROM ${BASE_IMAGE} AS build
+FROM ${BASE_IMAGE} AS rust
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
-# binutils checks the binary. cargo only reads the dependency graph of the
-# release tag and downloads the crates for their license files; it compiles
-# nothing. curl and xz fetch the source of the Rust standard library, also
-# for its license files.
-RUN apt-get update; \
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
     apt-get install -y --no-install-recommends \
-      binutils \
+      build-essential \
       ca-certificates \
-      cargo \
       curl \
       git \
+      gpgv \
+      python3 \
       xz-utils; \
     rm -rf /var/lib/apt/lists/*
 
-# typos publishes one static musl binary per architecture, which runs on any
-# Linux distribution. ADD checks each tarball against the SHA-256 pinned in
-# package.yml and leaves a remote tarball packed; the next step unpacks the
-# one for TARGETARCH.
-ARG VERSION
-ARG MUSL_AMD64_SHA256
-ARG MUSL_ARM64_SHA256
-ADD --checksum=sha256:${MUSL_AMD64_SHA256} https://github.com/crate-ci/typos/releases/download/v${VERSION}/typos-v${VERSION}-x86_64-unknown-linux-musl.tar.gz /tmp/dl/
-ADD --checksum=sha256:${MUSL_ARM64_SHA256} https://github.com/crate-ci/typos/releases/download/v${VERSION}/typos-v${VERSION}-aarch64-unknown-linux-musl.tar.gz /tmp/dl/
-
-# The binary is installed as published. It must be built for TARGETARCH, load
-# no libraries and report this version.
-ARG SOURCE_COMMIT
+# Rust comes from static.rust-lang.org instead of the distro, so that both
+# distros build with the same release. The release manifest is pinned in
+# package.yml and signed with the Rust release key, fingerprint
+# 108F 6620 5EAE B0AA A8DD 5E1C 85AB 96E6 FA1B E5FE; it lists the SHA-256 of
+# every archive that rust-toolchain.sh installs.
+ARG RUST_TOOLCHAIN_VERSION
+ARG RUST_TOOLCHAIN_SHA256
+ADD --checksum=sha256:${RUST_TOOLCHAIN_SHA256} https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml /tmp/rust/
+ADD https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml.asc /tmp/rust/
+COPY keys/rust.gpg /tmp/rust.gpg
 ARG TARGETARCH
+RUN --mount=type=bind,source=scripts/rust-toolchain.sh,target=/tmp/rust-toolchain.sh \
+    case "${TARGETARCH}" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    manifest="/tmp/rust/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml"; \
+    gpgv --keyring /tmp/rust.gpg "${manifest}.asc" "$manifest"; \
+    sh /tmp/rust-toolchain.sh "$manifest" "${RUST_TOOLCHAIN_VERSION}" "${arch}-unknown-linux-gnu" \
+      /opt/rust /opt/rust-src > /tmp/rust-toolchain
+ENV PATH=/opt/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_HOME=/opt/cargo \
+    CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=5 \
+    CARGO_TERM_COLOR=never
+
+# cargo-auditable is built from its crate, with the crates in its Cargo.lock.
+# It runs only in the build stage below. hadolint does not carry SHELL from
+# one stage into the next, so each stage repeats it.
+FROM rust AS auditable
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ARG CARGO_AUDITABLE_VERSION
+ARG CARGO_AUDITABLE_SHA256
+ADD --checksum=sha256:${CARGO_AUDITABLE_SHA256} https://static.crates.io/crates/cargo-auditable/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate /tmp/
+RUN mkdir /src; \
+    tar -xzf "/tmp/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate" -C /src; \
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" \
+      --manifest-path "/src/cargo-auditable-${CARGO_AUDITABLE_VERSION}/Cargo.toml"
+ARG JOBS
+RUN --network=none \
+    cargo install --frozen --root /opt/cargo-auditable -j "${JOBS:-$(nproc)}" \
+      --path "/src/cargo-auditable-${CARGO_AUDITABLE_VERSION}"
+
+FROM rust AS build
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# typos publishes no source tarball, so the release tag is cloned and must
+# point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
 RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
       || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
     printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
       || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
-    case "${TARGETARCH}" in \
-      amd64) arch=x86_64; machine='Advanced Micro Devices X86-64'; sha256="${MUSL_AMD64_SHA256}" ;; \
-      arm64) arch=aarch64; machine=AArch64; sha256="${MUSL_ARM64_SHA256}" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    asset="typos-v${VERSION}-${arch}-unknown-linux-musl.tar.gz"; \
-    mkdir /tmp/unpacked; \
-    tar -xzf "/tmp/dl/${asset}" -C /tmp/unpacked ./typos; \
-    install -D -m 755 /tmp/unpacked/typos /out/usr/local/bin/typos; \
-    typos=/out/usr/local/bin/typos; \
-    readelf -hW "$typos" > /tmp/elf-header; \
-    got="$(sed -n 's/^ *Machine: *//p' /tmp/elf-header)"; \
-    test "$got" = "$machine" || { echo "expected a binary for ${machine}, got: ${got}" >&2; exit 1; }; \
-    readelf -lW "$typos" > /tmp/elf-segments; \
-    if grep -E '^ +INTERP ' /tmp/elf-segments; then echo "typos is not statically linked" >&2; exit 1; fi; \
-    readelf -dW "$typos" > /tmp/elf-dynamic; \
-    if grep -F '(NEEDED)' /tmp/elf-dynamic; then echo "typos is not statically linked" >&2; exit 1; fi; \
-    "$typos" --version > /tmp/typos-version; \
-    test "$(cat /tmp/typos-version)" = "typos-cli ${VERSION}" \
-      || { echo "expected typos-cli ${VERSION}, got: $(cat /tmp/typos-version)" >&2; exit 1; }; \
-    readelf -p .comment "$typos" > /tmp/elf-comment; \
-    rustc="$(awk 'match($0, /rustc version [^)]*\)/) { print substr($0, RSTART, RLENGTH); exit }' /tmp/elf-comment)"; \
-    echo "${arch}-unknown-linux-musl" > /tmp/target; \
-    echo "https://github.com/crate-ci/typos/releases/download/v${VERSION}/${asset}" > /tmp/binary-url; \
-    { \
-      echo "binary: ${asset}"; \
-      echo "binary-sha256: ${sha256}"; \
-      echo "typos-sha256: $(sha256sum "$typos" | cut -d ' ' -f 1)"; \
-      echo "version: $(cat /tmp/typos-version)"; \
-      echo "rustc: ${rustc:-unknown}"; \
-    } > /tmp/buildinfo
-
-ARG BASE_IMAGE
-# The release tag is cloned and must point to the commit pinned in
-# package.yml. typos's own license files come from it, and the VarCon
-# copyright notice is cut from the README of the word list that typos-vars
-# is generated from. crate-licenses.sh copies the license files of the crates
-# in Cargo.lock that typos-cli depends on, and checks that every crate whose
-# source path the binary contains is among them. rust-licenses.sh copies those
-# of the Rust standard library and of LLVM's libunwind, which are linked into
-# the binary, from the source of the Rust release that built it. licenses/
-# holds the other texts: those that crates do not ship, the license and
-# notices of misspell, codespell and Wikipedia, whose word lists typos's own
-# draws on, a notice that marks the VarCon data in the binary as modified,
-# and musl's, which is linked in too. The binary loads no libraries, so
-# runtime-deps only has the packages in runtime-deps.ubuntu.
-RUN --mount=type=bind,source=scripts/crate-licenses.sh,target=/tmp/crate-licenses.sh \
-    --mount=type=bind,source=scripts/rust-licenses.sh,target=/tmp/rust-licenses.sh \
-    --mount=type=bind,source=licenses,target=/tmp/licenses \
-    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
     git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
       https://github.com/crate-ci/typos.git /src/typos; \
     test "$(git -C /src/typos rev-parse HEAD)" = "${SOURCE_COMMIT}" \
-      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
-    grep -Fqx "version = \"${VERSION}\"" /src/typos/crates/typos-cli/Cargo.toml \
-      || { echo "crates/typos-cli/Cargo.toml is not version ${VERSION}" >&2; exit 1; }; \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/typos
+# Upstream's .cargo/config.toml applies to this build. It sets nothing for
+# Linux today; a change stops the build until it has been read and its new
+# SHA-256 is in cargo-config.sha256. cargo fetch then downloads the crates in
+# Cargo.lock for this platform and checks each against its checksum there.
+RUN --mount=type=bind,source=cargo-config.sha256,target=/tmp/cargo-config.sha256 \
+    if [ -e .cargo/config ]; then echo "upstream ships .cargo/config, which this build does not check" >&2; exit 1; fi; \
+    if [ -f .cargo/config.toml ]; then \
+      test -f /tmp/cargo-config.sha256 \
+        || { cat .cargo/config.toml >&2; echo "upstream added .cargo/config.toml: read it, then pin it in cargo-config.sha256" >&2; exit 1; }; \
+      sha256sum -c /tmp/cargo-config.sha256 \
+        || { cat .cargo/config.toml >&2; echo "upstream changed .cargo/config.toml: read it, then pin it again" >&2; exit 1; }; \
+    elif [ -f /tmp/cargo-config.sha256 ]; then \
+      echo "cargo-config.sha256 pins a file that upstream no longer ships" >&2; exit 1; \
+    fi; \
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"; \
+    cargo pkgid --frozen -p typos-cli > /tmp/pkgid; \
+    case "$(cat /tmp/pkgid)" in \
+      *"#${VERSION}" | *"@${VERSION}") ;; \
+      *) echo "typos-cli is not version ${VERSION}: $(cat /tmp/pkgid)" >&2; exit 1 ;; \
+    esac
+
+# The build has no network: it reads only the crates fetched above.
+# cargo-auditable stores the list of crates in the binary's .dep-v0 section,
+# where SBOM tools and image scanners find it. Upstream's release profile is
+# used as it is, line tables included.
+COPY --link --from=auditable /opt/cargo-auditable/bin/cargo-auditable /opt/rust/bin/
+ARG JOBS
+RUN --network=none \
+    cargo auditable build --frozen --release -p typos-cli --bin typos -j "${JOBS:-$(nproc)}"; \
+    install -D -m 755 target/release/typos /out/usr/local/bin/typos; \
+    bin=/out/usr/local/bin/typos; \
+    "$bin" --version > /tmp/typos-version; \
+    test "$(cat /tmp/typos-version)" = "typos-cli ${VERSION}" \
+      || { echo "expected typos-cli ${VERSION}, got: $(cat /tmp/typos-version)" >&2; exit 1; }; \
+    readelf -hlSW "$bin" > /tmp/typos-elf; \
+    grep -Eq '^ *Type: +DYN ' /tmp/typos-elf || { cat /tmp/typos-elf >&2; exit 1; }; \
+    grep -Fq '[Requesting program interpreter: /lib' /tmp/typos-elf \
+      || { echo "typos is not dynamically linked" >&2; exit 1; }; \
+    grep -Fq ' .dep-v0 ' /tmp/typos-elf || { echo "typos has no cargo-auditable data" >&2; exit 1; }
+
+ARG BASE_IMAGE
+ARG RUST_TOOLCHAIN_VERSION
+ARG CARGO_AUDITABLE_VERSION
+ARG CARGO_AUDITABLE_SHA256
+# typos's own license files come from the tag, and the VarCon copyright notice
+# is cut from the README of the word list that typos-vars is generated from.
+# cargo-licenses.py copies the license files of every crate that the binary
+# records and of the Rust standard library, and stops when a crate's license
+# is not covered by package.yml's license. licenses/ holds the other texts:
+# those that crates do not ship, the license and notices of misspell,
+# codespell and Wikipedia, whose word lists typos's own draws on, and a notice
+# that marks the VarCon data in the binary as modified. runtime-deps lists the
+# packages that own the libraries typos loads, minus the base image's
+# packages, plus the packages in runtime-deps.ubuntu.
+RUN --network=none \
+    --mount=type=bind,source=scripts/cargo-licenses.py,target=/tmp/cargo-licenses.py \
+    --mount=type=bind,source=licenses,target=/tmp/licenses \
+    --mount=type=bind,source=package.yml,target=/tmp/package.yml \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
     meta=/out/usr/local/share/randomcontainers/typos; \
     mkdir -p "$meta/licenses/varcon"; \
-    cp /src/typos/LICENSE-MIT /src/typos/LICENSE-APACHE "$meta/licenses/"; \
-    awk '$0 == "Copyright" { c = 1 } c' /src/typos/crates/varcon/assets/README > "$meta/licenses/varcon/COPYRIGHT"; \
+    cp LICENSE-MIT LICENSE-APACHE "$meta/licenses/"; \
+    awk '$0 == "Copyright" { c = 1 } c' crates/varcon/assets/README > "$meta/licenses/varcon/COPYRIGHT"; \
     for s in 'Kevin Atkinson' 'Benjamin Titze' 'Geoff Kuenning' 'Permission to use, copy, modify'; do \
       grep -Fq "$s" "$meta/licenses/varcon/COPYRIGHT" \
         || { echo "the VarCon notice does not mention: $s" >&2; exit 1; }; \
     done; \
     cp /tmp/licenses/varcon/NOTICE "$meta/licenses/varcon/"; \
-    cp -R /tmp/licenses/misspell /tmp/licenses/codespell /tmp/licenses/wikipedia /tmp/licenses/musl \
-      "$meta/licenses/"; \
-    sh /tmp/crate-licenses.sh /src/typos typos-cli "$(cat /tmp/target)" /out/usr/local/bin/typos \
-      "$meta/licenses/crates" /tmp/licenses/crates > /tmp/crates; \
-    sh /tmp/rust-licenses.sh /out/usr/local/bin/typos "$meta/licenses/rust" > /tmp/rust-src; \
-    find "$meta/licenses" -type d -exec chmod 0755 {} \;; \
-    find "$meta/licenses" -type f -exec chmod 0644 {} \;; \
-    if find "$meta/licenses" -type f -size 0 | grep .; then echo "empty license file" >&2; exit 1; fi; \
+    cp -R /tmp/licenses/misspell /tmp/licenses/codespell /tmp/licenses/wikipedia "$meta/licenses/"; \
+    python3 -I /tmp/cargo-licenses.py \
+      --binary /out/usr/local/bin/typos --workspace /src/typos --package-yml /tmp/package.yml \
+      --extra /tmp/licenses/crates --rust-src /opt/rust-src \
+      --licenses "$meta/licenses" --sources "$meta/crate-sources" > /tmp/crates; \
     echo "${VERSION}" > "$meta/version"; \
-    printf '%s\n' \
-      "https://github.com/crate-ci/typos.git@${SOURCE_COMMIT}" \
-      "$(cat /tmp/binary-url)" \
-      > "$meta/source"; \
+    { \
+      echo "https://github.com/crate-ci/typos.git@${SOURCE_COMMIT}"; \
+      echo "https://github.com/crate-ci/typos/tree/${SOURCE_COMMIT}"; \
+      echo "https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml"; \
+      sed -n 's/^rust-src: \([^ ]*\) .*$/\1/p' /tmp/rust-toolchain; \
+      echo "https://static.crates.io/crates/cargo-auditable/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate"; \
+      sed -n 's/^source: //p' /tmp/crates; \
+    } > "$meta/source"; \
     { \
       echo "base: ${BASE_IMAGE}"; \
       echo "commit: ${SOURCE_COMMIT}"; \
-      cat /tmp/buildinfo; \
-      echo "cargo: $(cargo --version)"; \
-      cat /tmp/rust-src; \
+      echo "rust: ${RUST_TOOLCHAIN_VERSION}"; \
+      cat /tmp/rust-toolchain; \
+      rustc -vV; \
+      echo "linker: $(cc --version | sed -n 1p)"; \
+      echo "cargo-auditable: ${CARGO_AUDITABLE_VERSION} ${CARGO_AUDITABLE_SHA256}"; \
+      echo "rustflags: ${RUSTFLAGS:-}"; \
+      cat /tmp/typos-version; \
       echo "crates:"; \
-      sed 's/^/  /' /tmp/crates; \
+      sed -n 's/^crate: /  /p' /tmp/crates; \
     } > "$meta/buildinfo"; \
-    LC_ALL=C sort -u /tmp/runtime-deps.extra > "$meta/runtime-deps"
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
 
 FROM ${BASE_IMAGE} AS slim
 ARG DEBIAN_FRONTEND=noninteractive
