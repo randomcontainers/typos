@@ -75,8 +75,10 @@ test:
       || { echo "expected 'typos-cli $VERSION', got '$(cat version.txt)'" >&2; exit 1; }
   - |
     # typos is linked against the C library of the image it was built in, and
-    # its .dep-v0 section lists the crates it was built from.
-    head -c 4096 /usr/local/bin/typos | LC_ALL=C tr -c 'A-Za-z0-9_./-' '\n' | grep -E '^/lib(64)?/ld-' > loader.txt \
+    # its .dep-v0 section lists the crates it was built from. GNU ld puts the
+    # build ID right before the loader's path and tr may keep its last byte,
+    # so the path is matched anywhere in a word.
+    head -c 4096 /usr/local/bin/typos | LC_ALL=C tr -c 'A-Za-z0-9_./-' '\n' | grep -oE '/lib(64)?/ld-[A-Za-z0-9_.-]+' > loader.txt \
       || { echo "typos names no dynamic loader" >&2; exit 1; }
     loader=$(head -n 1 loader.txt)
     test -e "$loader" || { echo "typos needs $loader, which is not in the image" >&2; exit 1; }
