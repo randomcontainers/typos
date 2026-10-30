@@ -21,8 +21,10 @@ homepage: https://github.com/crate-ci/typos
 # text added since June 2023 is CC-BY-SA-4.0, and again from misspell, by
 # then the golangci/misspell fork under the same MIT text. Upstream ships the
 # whole list under its own terms (crate-ci/typos#44 is still open); the label
-# adds CC-BY-SA-3.0, as the codespell image's label does.
-license: MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND Apache-2.0 WITH LLVM-exception AND LicenseRef-VarCon AND CC-BY-SA-3.0
+# adds CC-BY-SA-3.0, as the codespell image's label does, for the entries
+# from codespell and for Wikipedia text from before June 2023, and
+# CC-BY-SA-4.0 for the newer Wikipedia text.
+license: MIT AND Apache-2.0 AND BSD-3-Clause AND Unicode-3.0 AND Apache-2.0 WITH LLVM-exception AND LicenseRef-VarCon AND CC-BY-SA-3.0 AND CC-BY-SA-4.0
 upstream:
   source: github-release
   repository: crate-ci/typos

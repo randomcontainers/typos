@@ -10,7 +10,8 @@ repository keeps a copy of the list in
 crates/wikipedia-dict/assets/dictionary.txt.
 
 Wikipedia releases the text of its pages under the Creative Commons
-Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0),
+Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0). The
+license text is in the file CC-BY-SA-4.0 next to this one and at
 https://creativecommons.org/licenses/by-sa/4.0/. Text added before June
 2023 was contributed under CC BY-SA 3.0, whose text is in
 ../codespell/CC-BY-SA-3.0.

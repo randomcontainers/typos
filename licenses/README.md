@@ -10,4 +10,5 @@ Five crates that typos is built from publish no license text, or only a file tha
 | `crates/siphasher-1.0.1/LICENSE-MIT`, `crates/siphasher-1.0.1/LICENSE-APACHE` | the texts that siphasher 1.0.1's `COPYING` names, from [jedisct1/rust-siphash](https://github.com/jedisct1/rust-siphash), where they were added in commit 07a910ae and first released in 1.0.4 |
 | `misspell/LICENSE` | `LICENSE` of [client9/misspell](https://github.com/client9/misspell) |
 | `codespell/CC-BY-SA-3.0` | the legal code of [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/legalcode.txt) |
+| `wikipedia/CC-BY-SA-4.0` | the legal code of [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt) |
 | `codespell/NOTICE`, `wikipedia/NOTICE`, `varcon/NOTICE` | written for this repository: where the entries of typos's word lists came from, and that the VarCon data in the binary is modified |
