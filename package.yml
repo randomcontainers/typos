@@ -31,13 +31,13 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.51.1
+  version: 1.52.0
   # The release tag is built with its Cargo.lock, and cargo checks every crate
   # it downloads against the checksum there.
   git:
     url: https://github.com/crate-ci/typos.git
     tag: v{version}
-    commit: 7f9d0819ca1c008ade73f4b41fa9d258d48f605b
+    commit: 4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85
   extra-artifacts:
     # The Rust release manifest, signed with the Rust release key in
     # keys/rust.gpg. scripts/rust-toolchain.sh installs rustc, cargo,
